@@ -1,5 +1,5 @@
 <#
-  TCAR ARC - Compliance Verification v3.2
+  TCAR ARC - Compliance Verification v3.3
   Stage 1 : System verification   (integrity, software and client-process checks)
   Stage 2 : Process Explorer      (process list shown on the recording)
   Stage 3 : Session monitor       (live monitoring for the duration of the match)
@@ -9,7 +9,7 @@
 
 $ErrorActionPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$script:Ver = '3.2'
+$script:Ver = '3.3'
 $script:Width = 78
 
 # ============================================================================ PRE-FLIGHT
@@ -130,6 +130,156 @@ public static int[] FindReaders(int[] targets) {
     return res.ToArray();
 }
 
+[DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, int size, out IntPtr read);
+
+static bool Rd(IntPtr h, long addr, byte[] buf, int len) {
+    IntPtr n;
+    if (!ReadProcessMemory(h, (IntPtr)addr, buf, len, out n)) return false;
+    return n.ToInt64() == len;
+}
+
+static int RvaToOff(byte[] d, uint rva, int secTab, int nsec) {
+    for (int i = 0; i < nsec; i++) {
+        int s = secTab + i * 40;
+        uint vsz = BitConverter.ToUInt32(d, s + 8);
+        uint va = BitConverter.ToUInt32(d, s + 12);
+        uint rsz = BitConverter.ToUInt32(d, s + 16);
+        uint raw = BitConverter.ToUInt32(d, s + 20);
+        uint span = vsz > rsz ? vsz : rsz;
+        if (rva >= va && rva < va + span) return (int)(rva - va + raw);
+    }
+    return -1;
+}
+
+static string Hex(byte[] b, int off, int n) {
+    System.Text.StringBuilder sb = new System.Text.StringBuilder();
+    for (int i = 0; i < n; i++) sb.Append(b[off + i].ToString("X2"));
+    return sb.ToString();
+}
+
+// Recognises the common inline-hook trampolines at the start of a function (directly, after
+// "mov r10,rcx", or after "mov r10,rcx; mov eax,imm32") and returns the redirect destination.
+static long HookDest(IntPtr h, long addr, byte[] b, out string kind) {
+    kind = "";
+    int[] offs = new int[] { 0, 3, 8 };
+    foreach (int k in offs) {
+        if (k + 12 > b.Length) continue;
+        if (b[k] == 0xE9) { kind = "jmp"; return addr + k + 5 + BitConverter.ToInt32(b, k + 1); }
+        if (b[k] == 0xEB) { kind = "short-jmp"; return addr + k + 2 + (sbyte)b[k + 1]; }
+        if (b[k] == 0xFF && b[k + 1] == 0x25) {
+            kind = "jmp-indirect";
+            byte[] q = new byte[8];
+            if (Rd(h, addr + k + 6 + BitConverter.ToInt32(b, k + 2), q, 8)) return BitConverter.ToInt64(q, 0);
+            return 0;
+        }
+        if (b[k] == 0x48 && b[k + 1] == 0xB8 && b[k + 10] == 0xFF && b[k + 11] == 0xE0) { kind = "mov-jmp"; return BitConverter.ToInt64(b, k + 2); }
+        if (b[k] == 0x49 && b[k + 1] == 0xBB && b[k + 10] == 0x41 && b[k + 11] == 0xFF) { kind = "mov-jmp"; return BitConverter.ToInt64(b, k + 2); }
+        if (b[k] == 0x68 && b[k + 5] == 0xC3) { kind = "push-ret"; return (long)BitConverter.ToInt32(b, k + 1); }
+    }
+    return 0;
+}
+
+// Compares the first 16 bytes of exported functions of a loaded system DLL in a target process
+// against the same bytes in the on-disk file. ntPrefix selects every Nt*/Zw* export; extra adds named exports.
+// Each result line:  name|kind|destinationHex|memoryBytes|diskBytes   (kind = redirect type or "modified")
+public static string[] ScanHooks(int pid, string diskPath, long targetBase, bool ntPrefix, string[] extra) {
+    List<string> res = new List<string>();
+    byte[] d;
+    try { d = System.IO.File.ReadAllBytes(diskPath); } catch { return null; }
+    IntPtr h = OpenProcess(0x1010, false, pid);
+    if (h == IntPtr.Zero) return null;
+    try {
+        if (d.Length < 0x400) return null;
+        int pe = BitConverter.ToInt32(d, 0x3C);
+        if (pe < 0 || pe + 0x100 > d.Length || BitConverter.ToUInt32(d, pe) != 0x4550) return null;
+        int nsec = BitConverter.ToUInt16(d, pe + 6);
+        int osz = BitConverter.ToUInt16(d, pe + 20);
+        int opt = pe + 24;
+        if (BitConverter.ToUInt16(d, opt) != 0x20B) return null;
+        int secTab = opt + osz;
+        uint expRva = BitConverter.ToUInt32(d, opt + 112);
+        uint expSize = BitConverter.ToUInt32(d, opt + 116);
+        int eo = RvaToOff(d, expRva, secTab, nsec);
+        if (eo < 0) return null;
+        int nNames = BitConverter.ToInt32(d, eo + 24);
+        int aF = RvaToOff(d, BitConverter.ToUInt32(d, eo + 28), secTab, nsec);
+        int aN = RvaToOff(d, BitConverter.ToUInt32(d, eo + 32), secTab, nsec);
+        int aO = RvaToOff(d, BitConverter.ToUInt32(d, eo + 36), secTab, nsec);
+        if (aF < 0 || aN < 0 || aO < 0) return null;
+        HashSet<string> want = new HashSet<string>();
+        if (extra != null) { foreach (string x in extra) want.Add(x); }
+        byte[] mem = new byte[24];
+        byte[] db = new byte[16];
+        for (int i = 0; i < nNames; i++) {
+            int no = RvaToOff(d, BitConverter.ToUInt32(d, aN + i * 4), secTab, nsec);
+            if (no < 0) continue;
+            int e = no;
+            while (e < d.Length && d[e] != 0) e++;
+            string name = System.Text.Encoding.ASCII.GetString(d, no, e - no);
+            bool isNt = ntPrefix && name.Length > 2 && (name.StartsWith("Nt") || name.StartsWith("Zw")) && char.IsUpper(name[2]);
+            if (!isNt && !want.Contains(name)) continue;
+            int ord = BitConverter.ToUInt16(d, aO + i * 2);
+            uint frva = BitConverter.ToUInt32(d, aF + ord * 4);
+            if (frva >= expRva && frva < expRva + expSize) continue;
+            int fo = RvaToOff(d, frva, secTab, nsec);
+            if (fo < 0 || fo + 24 > d.Length) continue;
+            long addr = targetBase + frva;
+            if (!Rd(h, addr, mem, 24)) continue;
+            bool same = true;
+            for (int j = 0; j < 16; j++) { if (mem[j] != d[fo + j]) { same = false; break; } }
+            if (same) continue;
+            string kind;
+            long dest = HookDest(h, addr, mem, out kind);
+            Array.Copy(d, fo, db, 0, 16);
+            res.Add(name + "|" + (kind.Length > 0 ? kind : "modified") + "|" + dest.ToString("X") + "|" + Hex(mem, 0, 16) + "|" + Hex(db, 0, 16));
+        }
+    } catch { return null; } finally { CloseHandle(h); }
+    return res.ToArray();
+}
+
+// Finds direct/indirect system-call stubs ("mov r10,rcx; mov eax,imm; ... syscall") inside executable
+// memory that is not an image (private or mapped regions). Legitimate code only issues syscalls from ntdll/win32u.
+// Each result line:  regionBaseHex|private-or-mapped|offsetHex
+public static string[] ScanSyscallStubs(int pid) {
+    List<string> res = new List<string>();
+    IntPtr h = OpenProcess(0x0410, false, pid);
+    if (h == IntPtr.Zero) return null;
+    long addr = 0, scanned = 0;
+    MBI m;
+    UIntPtr sz = (UIntPtr)Marshal.SizeOf(typeof(MBI));
+    while (VirtualQueryEx(h, (IntPtr)addr, out m, sz) != UIntPtr.Zero) {
+        long size = (long)m.RegionSize.ToUInt64();
+        uint pr = m.Protect & 0xFF;
+        bool exec = (pr == 0x10 || pr == 0x20 || pr == 0x40 || pr == 0x80);
+        if (m.State == 0x1000 && m.Type != 0x1000000 && exec && size > 0 && size <= 0x2000000 && scanned < 0x10000000) {
+            byte[] buf = new byte[size];
+            if (Rd(h, m.BaseAddress.ToInt64(), buf, (int)size)) {
+                scanned += size;
+                for (int i = 0; i + 2 < buf.Length; i++) {
+                    if (buf[i] == 0x0F && buf[i + 1] == 0x05) {
+                        int lo = i - 24;
+                        if (lo < 0) lo = 0;
+                        bool stub = false;
+                        for (int k = lo; k + 3 < i; k++) {
+                            if (buf[k] == 0x4C && buf[k + 1] == 0x8B && buf[k + 2] == 0xD1 && buf[k + 3] == 0xB8) { stub = true; break; }
+                        }
+                        if (stub) {
+                            res.Add(m.BaseAddress.ToInt64().ToString("X") + "|" + (m.Type == 0x20000 ? "private" : "mapped") + "|" + i.ToString("X"));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        long next = addr + size;
+        if (next <= addr || next > 0x7FFFFFFEFFFFL) break;
+        addr = next;
+        if (res.Count >= 20) break;
+    }
+    CloseHandle(h);
+    return res.ToArray();
+}
+
 // Shannon entropy of the first 4 MB of a file (packed/encrypted binaries score ~7.2-7.95).
 public static double Entropy(string path) {
     try {
@@ -206,6 +356,33 @@ $script:MasqueradePaths = @{
 $script:ReaderAllowlist = @('robloxplayerbeta', 'robloxcrashhandler', 'robloxplayerlauncher', 'bloxstrap', 'fishstrap', 'msmpeng', 'nissrv',
     'securityhealthservice', 'mpdefendercoreservice', 'csrss', 'lsass', 'wininit', 'services', 'searchindexer', 'wmiprvse', 'procexp', 'procexp64', 'taskmgr', 'perfmon', 'resmon', 'svchost')
 $script:DnsAllow = '(?i)(^|\.)(microsoft\.com|clarity\.ms|msftconnecttest\.com|photonengine\.com|matrix\.org|roblox\.com|rbxcdn\.com|rbx\.com|discord\.com|discordapp\.com|gstatic\.com|googleapis\.com|cloudflare\.com|windowsupdate\.com|live\.com|office\.com|nvidia\.com|steampowered\.com|github\.com|githubusercontent\.com)$'
+
+# OBS Studio: executables that legitimately ship with / are launched by OBS.
+$script:ObsKnownExe = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($n in @('obs64.exe', 'obs32.exe', 'obs-browser-page.exe', 'obs-ffmpeg-mux.exe', 'obs-amf-test.exe', 'obs-nvenc-test.exe', 'obs-qsv-test.exe',
+    'obs-webrtc-test.exe', 'get-graphics-offsets32.exe', 'get-graphics-offsets64.exe', 'inject-helper32.exe', 'inject-helper64.exe', 'uninstall.exe', 'unins000.exe')) { [void]$script:ObsKnownExe.Add($n) }
+
+# Microsoft C/C++ runtime DLLs. Apps may ship their own copy, but it must be the genuine, Microsoft-signed one.
+$script:CrtDllRx = '(?i)^(vcruntime\d+(_\d+)?|msvcp\d+(_\d+)?|concrt\d+|vccorlib\d+|msvcr\d+|mfc\d+\w*|ucrtbase)\.dll$'
+
+# APIs whose tampering is never acceptable (memory access, thread/process injection, module loading, ETW, AMSI, input and capture hiding).
+$script:HookCritical = @('NtProtectVirtualMemory', 'NtWriteVirtualMemory', 'NtReadVirtualMemory', 'NtAllocateVirtualMemory', 'NtFreeVirtualMemory', 'NtCreateThreadEx',
+    'NtOpenProcess', 'NtQuerySystemInformation', 'NtQueryVirtualMemory', 'NtMapViewOfSection', 'NtUnmapViewOfSection', 'NtSetContextThread', 'NtGetContextThread',
+    'NtQueueApcThread', 'NtSuspendThread', 'NtResumeThread', 'NtTerminateProcess', 'NtCreateSection', 'NtDuplicateObject', 'NtQueryInformationProcess',
+    'NtSetInformationThread', 'NtDeviceIoControlFile', 'NtTraceEvent', 'NtTraceControl', 'EtwEventWrite', 'EtwEventWriteFull', 'EtwEventWriteTransfer',
+    'LdrLoadDll', 'LdrGetProcedureAddress', 'AmsiScanBuffer', 'AmsiScanString', 'AmsiInitialize', 'AmsiOpenSession', 'ReadProcessMemory', 'WriteProcessMemory',
+    'VirtualProtect', 'VirtualProtectEx', 'CreateRemoteThread', 'CreateRemoteThreadEx', 'LoadLibraryA', 'LoadLibraryW', 'LoadLibraryExA', 'LoadLibraryExW',
+    'GetProcAddress', 'SetWindowsHookExA', 'SetWindowsHookExW', 'SetWindowDisplayAffinity', 'GetAsyncKeyState', 'SendInput')
+# Extra named exports checked in addition to the Nt*/Zw* syscall stubs of ntdll.dll and win32u.dll.
+$script:HookApis = @{
+    'ntdll.dll'      = @('EtwEventWrite', 'EtwEventWriteFull', 'EtwEventWriteTransfer', 'LdrLoadDll', 'LdrGetProcedureAddress', 'LdrGetDllHandle', 'RtlAddVectoredExceptionHandler')
+    'kernelbase.dll' = @('ReadProcessMemory', 'WriteProcessMemory', 'VirtualProtect', 'VirtualProtectEx', 'VirtualAlloc', 'VirtualAllocEx', 'CreateRemoteThread', 'CreateRemoteThreadEx',
+        'LoadLibraryA', 'LoadLibraryW', 'LoadLibraryExA', 'LoadLibraryExW', 'GetProcAddress', 'OpenProcess', 'CreateProcessW', 'CreateProcessA', 'CreateProcessInternalW', 'GetModuleHandleW')
+    'kernel32.dll'   = @('ReadProcessMemory', 'WriteProcessMemory', 'VirtualProtect', 'VirtualProtectEx', 'VirtualAlloc', 'VirtualAllocEx', 'CreateRemoteThread', 'CreateRemoteThreadEx',
+        'LoadLibraryA', 'LoadLibraryW', 'LoadLibraryExA', 'LoadLibraryExW', 'GetProcAddress', 'OpenProcess', 'CreateProcessW', 'CreateProcessA')
+    'user32.dll'     = @('SetWindowsHookExA', 'SetWindowsHookExW', 'GetAsyncKeyState', 'GetKeyState', 'SendInput', 'SetWindowDisplayAffinity', 'GetWindowDisplayAffinity', 'FindWindowW', 'EnumWindows')
+    'amsi.dll'       = @('AmsiScanBuffer', 'AmsiScanString', 'AmsiInitialize', 'AmsiOpenSession')
+}
 
 # ============================================================================ HELPERS
 function Get-Indicator {
@@ -617,27 +794,228 @@ function Get-MemoryReaderAlerts {
     return $o
 }
 
-function Get-ClientInstallAlerts {
-    $o = @(); $n = 0; $bad = @()
-    # Only the newest installed version of each launcher is verified (old version folders are not in use).
-    foreach ($d in @("$env:LOCALAPPDATA\Roblox\Versions", "$env:LOCALAPPDATA\Bloxstrap\Versions", "$env:LOCALAPPDATA\Fishstrap\Versions")) {
-        if (-not (Test-Path -LiteralPath $d)) { continue }
-        $latest = Get-ChildItem -LiteralPath $d -Directory | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-        if (-not $latest) { continue }
-        foreach ($f in @(Get-ChildItem -LiteralPath $latest.FullName -Recurse -File -Include *.dll, *.exe)) {
-            $n++
-            if ((Get-SigInfo -Path $f.FullName).Status -ne 'Valid') { $bad += $f.FullName }
-            elseif (Get-Indicator $f.Name) { $o += "FAILURE: Client install contains a file matching an indicator -> $($f.FullName)" }
+# ---------------------------------------------------------------------------- OBS & app tamper
+function Get-ObsRoots {
+    $roots = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($p in @(Get-Process -Name obs64, obs32)) {
+        $path = $null; try { $path = $p.Path } catch {}
+        if ($path) {
+            $r = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $path))
+            if ($r -and -not $roots.Contains($r)) { $roots.Add($r) }
         }
     }
-    if ($bad.Count -gt 0) { $o += "FAILURE: $($bad.Count) unsigned/invalid file(s) in the client install folder ($(Get-ExampleText ($bad | ForEach-Object { Split-Path -Leaf $_ })))" }
-    foreach ($f in @(Get-ChildItem "$env:LOCALAPPDATA\Roblox\Versions\*\ClientSettings\ClientAppSettings.json", "$env:LOCALAPPDATA\Bloxstrap\Modifications\ClientSettings\ClientAppSettings.json", "$env:LOCALAPPDATA\Fishstrap\Modifications\ClientSettings\ClientAppSettings.json")) {
+    foreach ($r in @("$env:ProgramFiles\obs-studio", "${env:ProgramFiles(x86)}\obs-studio", "$env:LOCALAPPDATA\Programs\obs-studio")) {
+        if ($r -and (Test-Path -LiteralPath "$r\bin") -and -not $roots.Contains($r)) { $roots.Add($r) }
+    }
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\OBS Studio') {
+        $loc = ([string](Get-ItemProperty -Path $k -Name InstallLocation).InstallLocation).TrimEnd('\')
+        if ($loc -and (Test-Path -LiteralPath "$loc\bin") -and -not $roots.Contains($loc)) { $roots.Add($loc) }
+    }
+    return @($roots)
+}
+
+# One module (DLL/EXE) loaded into obs64. Returns $null when it is acceptable.
+function Test-ObsModule {
+    param([string]$File, [string[]]$Roots)
+    $leaf = [IO.Path]::GetFileName($File)
+    $inObs = $false
+    foreach ($r in $Roots) { if ($r -and $File.StartsWith($r + '\', [StringComparison]::OrdinalIgnoreCase)) { $inObs = $true } }
+    $inPlugin = ($File -match '(?i)\\obs-plugins\\') -or ($File -match '(?i)\\obs-studio\\plugins\\')
+    $kw = Get-Indicator $File
+    $s = Get-SigInfo -Path $File
+    $isMs = ($s.Status -eq 'Valid' -and $s.Subject -match 'Microsoft')
+    $sysName = (Test-Path -LiteralPath (Join-Path "$env:SystemRoot\System32" $leaf)) -or ($leaf -match $script:CrtDllRx)
+
+    # A Windows or C/C++ runtime DLL name (vcruntime140.dll, version.dll, dxgi.dll ...) outside the system folders
+    # must be the genuine Microsoft-signed file; anything else is a sideloaded / proxy DLL.
+    if ($sysName -and -not $isMs) {
+        return "FAILURE: Windows/runtime DLL name '$leaf' loaded in OBS from outside the system folders without a Microsoft signature (sideloaded or proxy DLL, $($s.Status)) -> $File"
+    }
+    if ($s.Status -ne 'Valid') {
+        $e = [TCAR.Native]::Entropy($File)
+        $tag = if ($kw) { " [match: $kw]" } else { '' }
+        if ($inPlugin -or -not $inObs) { return "FAILURE: Unsigned module$tag loaded in OBS ($($s.Status), entropy $e) -> $File" }
+        return "WARNING: Unsigned OBS component$tag loaded ($($s.Status), entropy $e) - reinstall OBS if this is not a plugin -> $File"
+    }
+    if ($kw) { return "FAILURE: OBS module matches unauthorized-software indicator [$kw] -> $File" }
+    if (-not $inObs -and -not (Test-TrustedDir $File)) { return "WARNING: Signed module loaded in OBS from outside the OBS and program folders -> $File" }
+    return $null
+}
+
+function Get-ObsTamperAlerts {
+    $o = @()
+    $roots = @(Get-ObsRoots)
+    $procs = @(Get-Process -Name obs64, obs32)
+    if ($roots.Count -eq 0 -and $procs.Count -eq 0) { return @('INFO: OBS Studio is not installed or running - nothing to verify') }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $budget = 25
+    $checked = 0
+    $unsignedPlug = @(); $unsignedBin = @()
+
+    foreach ($root in $roots) {
+        # the OBS executables themselves
+        foreach ($e in @(Get-ChildItem -Path "$root\bin\*\obs*.exe")) {
+            $s = Get-SigInfo -Path $e.FullName; $checked++
+            if ($s.Status -ne 'Valid') { $o += "FAILURE: OBS executable is not validly signed ($($s.Status)) -> $($e.FullName)" }
+            if (Test-Path -LiteralPath "$($e.FullName).local") { $o += "FAILURE: DLL redirection folder next to OBS executable -> $($e.FullName).local" }
+            if (Test-Path -LiteralPath "$($e.FullName).manifest") { $o += "WARNING: External manifest next to OBS executable -> $($e.FullName).manifest" }
+        }
+        # every executable inside the OBS install tree must be a known OBS component
+        foreach ($f in @(Get-ChildItem -LiteralPath $root -Recurse -File -Filter *.exe)) {
+            $s = Get-SigInfo -Path $f.FullName; $checked++
+            if ($script:ObsKnownExe.Contains($f.Name)) {
+                if ($s.Status -ne 'Valid') { $o += "FAILURE: OBS component executable is not validly signed ($($s.Status)) -> $($f.FullName)" }
+            } elseif ($s.Status -ne 'Valid') { $o += "FAILURE: Unrecognized unsigned executable inside the OBS install -> $($f.FullName)" }
+            else { $o += "WARNING: Unrecognized executable inside the OBS install -> $($f.FullName)" }
+        }
+        # plugin and core DLLs
+        foreach ($dir in @(@("$root\obs-plugins", $true), @("$root\bin", $false))) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $dir[0] -Recurse -File -Filter *.dll)) {
+                if ($sw.Elapsed.TotalSeconds -gt $budget) { break }
+                $checked++
+                $kw = Get-Indicator $f.Name
+                $s = Get-SigInfo -Path $f.FullName
+                $isMs = ($s.Status -eq 'Valid' -and $s.Subject -match 'Microsoft')
+                $sysName = (Test-Path -LiteralPath (Join-Path "$env:SystemRoot\System32" $f.Name)) -or ($f.Name -match $script:CrtDllRx)
+                if ($sysName -and -not $isMs) { $o += "FAILURE: Windows/runtime DLL name '$($f.Name)' in the OBS folder without a Microsoft signature (sideload/proxy DLL, $($s.Status)) -> $($f.FullName)" }
+                elseif ($kw) { $o += "FAILURE: OBS file matches indicator [$kw] -> $($f.FullName)" }
+                elseif ($s.Status -ne 'Valid') { if ($dir[1]) { $unsignedPlug += $f.FullName } else { $unsignedBin += $f.FullName } }
+            }
+        }
+    }
+    # user-installed plugins (loaded by OBS from the profile folder)
+    foreach ($f in @(Get-ChildItem -LiteralPath "$env:APPDATA\obs-studio\plugins" -Recurse -File -Filter *.dll)) {
+        $checked++
+        $kw = Get-Indicator $f.Name
+        if ($kw) { $o += "FAILURE: OBS user plugin matches indicator [$kw] -> $($f.FullName)" }
+        elseif ((Get-SigInfo -Path $f.FullName).Status -ne 'Valid') { $unsignedPlug += $f.FullName }
+    }
+    if ($unsignedPlug.Count -gt 0) { $o += "WARNING: $($unsignedPlug.Count) unsigned OBS plugin DLL(s) installed ($(Get-ExampleText ($unsignedPlug | ForEach-Object { Split-Path -Leaf $_ })))" }
+    if ($unsignedBin.Count -gt 0) { $o += "WARNING: $($unsignedBin.Count) unsigned DLL(s) in the OBS bin folder ($(Get-ExampleText ($unsignedBin | ForEach-Object { Split-Path -Leaf $_ })))" }
+
+    # scripts (Lua/Python) saved in scene collections run inside OBS
+    foreach ($f in @(Get-ChildItem -Path "$env:APPDATA\obs-studio\basic\scenes\*.json")) {
         $txt = [IO.File]::ReadAllText($f.FullName)
-        foreach ($flag in 'FFlagDebugDisplayUntrackedMemory', 'FFlagDebugGraphicsDisableDirect3D11', 'FFlagVisualEngine') {
-            if ($txt.Contains($flag)) { $o += "WARNING: Client setting $flag in $($f.FullName)" }
+        foreach ($mt in [regex]::Matches($txt, '"path"\s*:\s*"([^"]+\.(?:lua|py))"', 'IgnoreCase')) {
+            $sp = ($mt.Groups[1].Value -replace '\\\\', '\') -replace '/', '\'
+            $kw = Get-Indicator $sp
+            if ($kw) { $o += "FAILURE: OBS script matches indicator [$kw] in collection '$($f.BaseName)' -> $sp" }
+            else { $o += "WARNING: OBS script runs in collection '$($f.BaseName)' -> $sp" }
         }
     }
-    if ($o.Count -eq 0) { $o += "SUCCESS: $n client files verified, no risky client settings" }
+
+    # live process: loaded modules, unrecognized programs launched by OBS, injected executable memory
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $live = 0
+    foreach ($p in $procs) {
+        $mods = $null
+        try { $mods = @($p.Modules) } catch { $o += "WARNING: Could not enumerate modules of OBS PID $($p.Id)"; continue }
+        foreach ($m in $mods) {
+            $f = [string]$m.FileName
+            if (-not $f -or -not $seen.Add($f)) { continue }
+            if ($f.StartsWith("$env:SystemRoot\", [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $live++
+            $r = Test-ObsModule -File $f -Roots $roots
+            if ($r) { $o += $r }
+        }
+        $res = [TCAR.Native]::ScanRwx($p.Id)
+        if ($null -ne $res -and $res[0] -gt 0) { $o += "WARNING: OBS PID $($p.Id) holds $($res[0]) private read/write/execute region(s), $([math]::Round($res[1] / 1KB)) KB (possible injected code)" }
+    }
+    $ids = @($procs | ForEach-Object { [int]$_.Id })
+    if ($ids.Count -gt 0) {
+        foreach ($c in @(Get-CimInstance Win32_Process | Where-Object { $ids -contains [int]$_.ParentProcessId })) {
+            $nm = [string]$c.Name; $path = [string]$c.ExecutablePath
+            if ($nm -ieq 'conhost.exe') { continue }
+            if ($script:ObsKnownExe.Contains($nm)) {
+                $under = $false
+                foreach ($r in $roots) { if ($path -and $path.StartsWith($r + '\', [StringComparison]::OrdinalIgnoreCase)) { $under = $true } }
+                if ($path -and -not $under) { $o += "FAILURE: OBS helper name '$nm' running from outside the OBS install -> $path" }
+                continue
+            }
+            $st = 'Unknown'; if ($path -and (Test-Path -LiteralPath $path)) { $st = (Get-SigInfo -Path $path).Status }
+            if ($st -ne 'Valid') { $o += "FAILURE: Unrecognized unsigned program launched by OBS: $nm -> $path" }
+            else { $o += "WARNING: Unrecognized program launched by OBS: $nm -> $path" }
+        }
+    }
+
+    if (-not ($o | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
+        if ($procs.Count -gt 0) { $o += "SUCCESS: OBS install, plugins, $live loaded modules and child processes verified ($checked files)" }
+        else { $o += "SUCCESS: OBS install and plugins verified ($checked files); OBS is not running" }
+    }
+    return $o
+}
+
+# ---------------------------------------------------------------------------- Native syscall hooks
+# Compares the in-memory prologues of ntdll/win32u/kernelbase/kernel32/user32/amsi exports (syscall stubs, ETW,
+# AMSI, memory and loader APIs) with the on-disk files, and looks for syscall stubs living outside ntdll.
+function Invoke-HookScan {
+    param([System.Diagnostics.Process]$Proc, [string]$Label, [bool]$Strict)
+    $o = @()
+    $mods = $null
+    try { $mods = @($Proc.Modules) } catch { return @("WARNING: Could not read modules of $Label (PID $($Proc.Id)) - hook scan skipped") }
+    $sys32 = "$env:SystemRoot\System32"
+    $found = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($t in @(@('ntdll.dll', $true), @('win32u.dll', $true), @('kernelbase.dll', $false), @('kernel32.dll', $false), @('user32.dll', $false), @('amsi.dll', $false))) {
+        $m = $mods | Where-Object { $_.ModuleName -ieq $t[0] -and ([string]$_.FileName) -like "$sys32\*" } | Select-Object -First 1
+        if (-not $m) { continue }
+        $extra = $script:HookApis[$t[0]]
+        $r = [TCAR.Native]::ScanHooks($Proc.Id, (Join-Path $sys32 $t[0]), $m.BaseAddress.ToInt64(), [bool]$t[1], [string[]]$extra)
+        if ($null -eq $r) { $o += "WARNING: Hook scan of $($t[0]) in $Label (PID $($Proc.Id)) could not run"; continue }
+        foreach ($line in $r) {
+            $pt = ([string]$line).Split('|')
+            $found.Add(@{ Dll = $t[0]; Name = $pt[0]; Kind = $pt[1]; Dest = [Convert]::ToInt64($pt[2], 16) })
+        }
+    }
+
+    $groups = @{}; $groupCrit = @{}
+    $critMod = @(); $mod = @()
+    foreach ($f in $found) {
+        $crit = ($script:HookCritical -contains $f.Name)
+        $tag = "$($f.Dll)!$($f.Name)"
+        if ($f.Kind -eq 'modified') { if ($crit) { $critMod += $tag } else { $mod += $tag }; continue }
+        $dm = $null
+        if ($f.Dest -ne 0) {
+            $dm = $mods | Where-Object { $a = $_.BaseAddress.ToInt64(); $f.Dest -ge $a -and $f.Dest -lt ($a + $_.ModuleMemorySize) } | Select-Object -First 1
+        }
+        $key = if ($dm) { [string]$dm.FileName } elseif ($f.Dest -ne 0) { 'unbacked' } else { 'unresolved' }
+        if (-not $groups.ContainsKey($key)) { $groups[$key] = New-Object 'System.Collections.Generic.List[string]'; $groupCrit[$key] = $false }
+        $groups[$key].Add($tag)
+        if ($crit) { $groupCrit[$key] = $true }
+    }
+    foreach ($key in @($groups.Keys)) {
+        $items = @($groups[$key])
+        $ex = Get-ExampleText $items
+        $lvl = 'WARNING'; $where = $key
+        if ($key -eq 'unbacked') { $where = 'unbacked (private) memory'; if ($Strict -or $groupCrit[$key]) { $lvl = 'FAILURE' } }
+        elseif ($key -eq 'unresolved') { $where = 'an unresolved address'; if ($Strict) { $lvl = 'FAILURE' } }
+        else {
+            $s = Get-SigInfo -Path $key
+            if ($s.Status -eq 'Valid' -and $s.Subject -match 'Microsoft' -and $key.StartsWith("$env:SystemRoot\", [StringComparison]::OrdinalIgnoreCase)) { continue }   # Windows shim/compat layer
+            if ($s.Status -ne 'Valid' -or (Get-Indicator $key)) { $lvl = 'FAILURE' }
+        }
+        $o += "${lvl}: Inline hook on $($items.Count) native API function(s) in $Label (PID $($Proc.Id)) redirected to $where ($ex)"
+    }
+    if ($critMod.Count -gt 0) { $o += "FAILURE: Patched prologue of critical API(s) in $Label (PID $($Proc.Id)) - syscall/ETW/AMSI/memory bypass pattern ($(Get-ExampleText $critMod))" }
+    if ($mod.Count -gt 0) { $o += "WARNING: $($mod.Count) function prologue(s) differ from the on-disk file in $Label (PID $($Proc.Id)) ($(Get-ExampleText $mod))" }
+
+    $st = [TCAR.Native]::ScanSyscallStubs($Proc.Id)
+    if ($st -and $st.Count -gt 0) {
+        $first = ([string]$st[0]).Split('|')
+        $lvl = if ($Strict) { 'FAILURE' } else { 'WARNING' }
+        $o += "${lvl}: Direct syscall stub in executable non-image memory of $Label (PID $($Proc.Id)): $($st.Count) region(s), first at 0x$($first[0]) ($($first[1]))"
+    }
+    return $o
+}
+
+function Get-SyscallHookAlerts {
+    $o = @(); $scanned = @()
+    $o += @(Invoke-HookScan -Proc (Get-Process -Id $PID) -Label 'this PowerShell session' -Strict $true)
+    $scanned += 'PowerShell'
+    foreach ($p in @(Get-Process -Name obs64, obs32)) { $o += @(Invoke-HookScan -Proc $p -Label 'OBS' -Strict $true); $scanned += 'OBS' }
+    $rbx = @(Get-Process -Name RobloxPlayerBeta)
+    foreach ($p in $rbx) { $o += @(Invoke-HookScan -Proc $p -Label 'Roblox client' -Strict $false); $scanned += 'Roblox client' }
+    if (-not ($o | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) { $o += "SUCCESS: Native API prologues match disk, no stray syscall stubs ($(($scanned | Select-Object -Unique) -join ', '))" }
+    if ($rbx.Count -eq 0) { $o += 'INFO: Roblox not started yet - client hooks are scanned live in stage 3' }
     return $o
 }
 
@@ -651,7 +1029,7 @@ function Get-InjectionVectorAlerts {
         foreach ($k in @(Get-ChildItem $root)) {
             $dbg = [string](Get-ItemProperty -Path $k.PSPath -Name Debugger).Debugger
             if (-not $dbg) { continue }
-            if ($k.PSChildName -match '(?i)roblox') { $o += "FAILURE: Launch hook (IFEO debugger) on $($k.PSChildName) -> $dbg" }
+            if ($k.PSChildName -match '(?i)roblox|obs64|obs32|powershell') { $o += "FAILURE: Launch hook (IFEO debugger) on $($k.PSChildName) -> $dbg" }
             elseif ($k.PSChildName -ieq 'Taskmgr.exe' -and $dbg -match '(?i)procexp') { continue }
             else { $o += "WARNING: IFEO debugger on $($k.PSChildName) -> $dbg" }
         }
@@ -853,10 +1231,106 @@ function Get-AuditTrailAlerts {
     return $o
 }
 
+# ---------------------------------------------------------------------------- PowerShell module integrity
+# One DLL loaded into (or installed for) PowerShell. Returns $null when it is acceptable.
+function Test-PsModuleFile {
+    param([string]$File, [string]$Who = 'PowerShell')
+    $kw = Get-Indicator ([IO.Path]::GetFileName($File))
+    $tag = if ($kw) { " [match: $kw]" } else { '' }
+    $s = Get-SigInfo -Path $File
+    if ($s.Status -ne 'Valid') {
+        $e = [TCAR.Native]::Entropy($File)
+        return "FAILURE: Unsigned DLL$tag loaded in $Who ($($s.Status), entropy $e) -> $File"
+    }
+    if ($kw) { return "FAILURE: Module matches unauthorized-software indicator [$kw] loaded in $Who -> $File" }
+    if ($s.Subject -notmatch 'Microsoft' -and -not (Test-TrustedDir $File)) { return "WARNING: Non-Microsoft DLL loaded in $Who from outside the Windows/Program Files folders -> $File" }
+    return $null
+}
+
+# Every module mapped into any running PowerShell process (the NotSigned / HashMismatch DLL check).
+function Get-PsLoadedModuleAlerts {
+    param([int]$BudgetSec = 25)
+    $o = @(); $checked = 0; $skipped = 0
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $selfAsm = ''; try { $selfAsm = [string][TCAR.Native].Assembly.Location } catch {}
+    foreach ($p in @(Get-Process -Name powershell, pwsh, powershell_ise)) {
+        $mods = $null
+        try { $mods = @($p.Modules) } catch { $o += "WARNING: Could not enumerate modules of PowerShell PID $($p.Id)"; continue }
+        $who = if ($p.Id -eq $PID) { 'this PowerShell session' } else { "PowerShell PID $($p.Id)" }
+        $files = @($mods | ForEach-Object { [string]$_.FileName } | Where-Object { $_ -and $_ -ne $selfAsm -and $_ -notmatch '(?i)\\assembly\\NativeImages_' } | Sort-Object -Unique)
+        $user = @($files | Where-Object { -not $_.StartsWith("$env:SystemRoot\", [StringComparison]::OrdinalIgnoreCase) })
+        $sysf = @($files | Where-Object { $_.StartsWith("$env:SystemRoot\", [StringComparison]::OrdinalIgnoreCase) })
+        foreach ($f in $user) { $checked++; $r = Test-PsModuleFile -File $f -Who $who; if ($r) { $o += $r } }
+        foreach ($f in $sysf) {
+            if ($sw.Elapsed.TotalSeconds -gt $BudgetSec) { $skipped++; continue }
+            $checked++
+            $r = Test-PsModuleFile -File $f -Who $who
+            if ($r) { $o += $r }
+        }
+    }
+    $script:PsModChecked = $checked
+    $script:PsModSkipped = $skipped
+    return $o
+}
+
+# Assemblies loaded from memory (Assembly.Load(byte[]) / reflective loading) never show up as DLL files.
+function Get-PsAssemblyAlerts {
+    $o = @()
+    foreach ($a in [AppDomain]::CurrentDomain.GetAssemblies()) {
+        if ($a.IsDynamic) { continue }
+        $loc = ''; try { $loc = [string]$a.Location } catch {}
+        if ($loc) { continue }
+        $own = $false; try { if ($a.GetType('TCAR.Native', $false)) { $own = $true } } catch {}
+        if ($own) { continue }
+        $o += "WARNING: In-memory (reflectively loaded) assembly in this PowerShell session -> $($a.FullName)"
+    }
+    return $o
+}
+
+# PSModulePath entries and the DLLs / module scripts installed in them.
+function Get-PsModulePathAlerts {
+    $o = @()
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $dirs = @($env:PSModulePath -split ';' | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') } | Select-Object -Unique)
+    foreach ($d in $dirs) {
+        if ($d -notmatch '(?i)\\(WindowsPowerShell|PowerShell(\\7)?)\\Modules$|\\v1\.0\\Modules$') { $o += "WARNING: Non-standard PowerShell module path in PSModulePath -> $d" }
+        if (-not (Test-Path -LiteralPath $d)) { continue }
+        $isSys = $d.StartsWith("$env:SystemRoot\", [StringComparison]::OrdinalIgnoreCase)
+        foreach ($f in @(Get-ChildItem -LiteralPath $d -Recurse -File -Filter *.dll)) {
+            if ($sw.Elapsed.TotalSeconds -gt 25) { break }
+            $kw = Get-Indicator $f.Name
+            $s = Get-SigInfo -Path $f.FullName
+            if ($s.Status -ne 'Valid') {
+                $lvl = if ($isSys -or $kw) { 'FAILURE' } else { 'WARNING' }
+                $o += "${lvl}: Unsigned DLL ($($s.Status)) in a PowerShell module folder -> $($f.FullName)"
+            } elseif ($kw) { $o += "FAILURE: PowerShell module DLL matches indicator [$kw] -> $($f.FullName)" }
+        }
+        if ($isSys) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $d -Recurse -File -Filter *.psm1)) {
+                if ($sw.Elapsed.TotalSeconds -gt 25) { break }
+                $s = Get-SigInfo -Path $f.FullName
+                if ($s.Status -eq 'HashMismatch') { $o += "FAILURE: Built-in PowerShell module script was modified after signing -> $($f.FullName)" }
+                elseif ($s.Status -eq 'NotSigned') { $o += "WARNING: Built-in PowerShell module script is unsigned -> $($f.FullName)" }
+            }
+        }
+    }
+    return $o
+}
+
 function Get-PowerShellAlerts {
     $o = @()
     $ps = Get-AuthenticodeSignature -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
     if (-not ($ps.Status -eq 'Valid' -and $ps.SignerCertificate.Subject -like '*Microsoft Windows*')) { $o += 'FAILURE: powershell.exe signature is invalid' }
+    $sma = ''; try { $sma = [string][psobject].Assembly.Location } catch {}
+    if ($sma) {
+        $s = Get-SigInfo -Path $sma
+        if ($s.Status -ne 'Valid') { $o += "FAILURE: System.Management.Automation.dll is not validly signed ($($s.Status)) -> $sma" }
+    }
+
+    $o += @(Get-PsLoadedModuleAlerts)
+    $o += @(Get-PsAssemblyAlerts)
+    $o += @(Get-PsModulePathAlerts)
+
     $defaults = @('Microsoft.PowerShell.Archive', 'Microsoft.PowerShell.Diagnostics', 'Microsoft.PowerShell.Host', 'Microsoft.PowerShell.LocalAccounts', 'Microsoft.PowerShell.Management',
         'Microsoft.PowerShell.Security', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Operation.Validation', 'PackageManagement', 'PowerShellGet', 'PSReadLine', 'Pester', 'ThreadJob')
     $extra = @(Get-ChildItem "$env:ProgramFiles\WindowsPowerShell\Modules" -Directory | Where-Object { $defaults -notcontains $_.Name } | ForEach-Object { $_.Name })
@@ -864,10 +1338,15 @@ function Get-PowerShellAlerts {
     foreach ($fn in @(Get-ChildItem Function:\ | Where-Object { $_.Source -eq '' -and $_.Name -match '^(Get|Test|Select|Where|Invoke)-' -and (Get-Command -CommandType Cmdlet -Name $_.Name) })) {
         $o += "FAILURE: Function overrides built-in cmdlet -> $($fn.Name)"
     }
+    foreach ($al in @(Get-Alias | Where-Object { Get-Command -CommandType Cmdlet -Name $_.Name })) {
+        $o += "FAILURE: Alias overrides built-in cmdlet -> $($al.Name) = $($al.Definition)"
+    }
     foreach ($p in @($PROFILE.AllUsersAllHosts, $PROFILE.AllUsersCurrentHost, $PROFILE.CurrentUserAllHosts, $PROFILE.CurrentUserCurrentHost)) {
         if ($p -and (Test-Path -LiteralPath $p -PathType Leaf)) { $o += "WARNING: PowerShell profile runs code at startup -> $p" }
     }
-    if ($o.Count -eq 0) { $o += 'SUCCESS: PowerShell binary, modules and session are untampered' }
+    if (-not ($o | Where-Object { $_ -like 'FAILURE*' -or $_ -like 'WARNING*' })) {
+        $o += "SUCCESS: $($script:PsModChecked) loaded modules, module folders and session are untampered"
+    }
     return $o
 }
 
@@ -965,14 +1444,15 @@ $checks = @(
     @{ N = 'Client: loaded modules';      R = { Get-ClientModuleAlerts } },
     @{ N = 'Client: memory regions';      R = { Get-ClientMemoryAlerts } },
     @{ N = 'Client: external readers';    R = { Get-MemoryReaderAlerts } },
-    @{ N = 'Client: install integrity';   R = { Get-ClientInstallAlerts } },
+    @{ N = 'OBS & app tamper';            R = { Get-ObsTamperAlerts } },
+    @{ N = 'Native syscall hooks';        R = { Get-SyscallHookAlerts } },
     @{ N = 'Load-hook vectors';           R = { Get-InjectionVectorAlerts } },
     @{ N = 'Software indicators';         R = { Get-SoftwareIndicatorAlerts } },
     @{ N = 'Network & pipes';             R = { Get-NetworkAlerts } },
     @{ N = 'Root certificates';           R = { Get-RootCertAlerts } },
     @{ N = 'Execution history';           R = { Get-ExecutionHistoryAlerts } },
     @{ N = 'Audit trail integrity';       R = { Get-AuditTrailAlerts } },
-    @{ N = 'PowerShell integrity';        R = { Get-PowerShellAlerts } },
+    @{ N = 'PowerShell module integrity'; R = { Get-PowerShellAlerts } },
     @{ N = 'Windows file impostors';      R = { Get-ImpostorAlerts } }
 )
 
@@ -1246,6 +1726,11 @@ $knownPids = @{}
 foreach ($cp in @(Get-CimInstance Win32_Process)) { $knownPids[[int]$cp.ProcessId] = $true }
 $prevExcl = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 foreach ($e in (Get-ExclusionList)) { [void]$prevExcl.Add($e) }
+$knownObsMods = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($op in @(Get-Process -Name obs64, obs32)) { try { foreach ($m in $op.Modules) { [void]$knownObsMods.Add([string]$m.FileName) } } catch {} }
+$knownPsMods = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($pp in @(Get-Process -Name powershell, pwsh, powershell_ise)) { try { foreach ($m in $pp.Modules) { [void]$knownPsMods.Add([string]$m.FileName) } } catch {} }
+$obsRoots = @(Get-ObsRoots)
 $lastRbxPid = 0
 $baseRwx = @{}
 $clientSince = $null
@@ -1306,10 +1791,35 @@ try {
             # ---- once startup settles, run the full client verification on the live client
             if ($clientSince -and -not $clientVerified -and ((Get-Date) - $clientSince).TotalSeconds -gt $graceSec) {
                 $clientVerified = $true
-                foreach ($l in @((Get-ClientModuleAlerts) + (Get-ClientMemoryAlerts) + (Get-MemoryReaderAlerts))) {
+                foreach ($l in @((Get-ClientModuleAlerts) + (Get-ClientMemoryAlerts) + (Get-MemoryReaderAlerts) + (Get-SyscallHookAlerts))) {
                     if ($l -like 'INFO: Roblox not started*') { continue }
                     Write-MonitorEvent -Line $l -AlwaysShow
                 }
+            }
+
+            # ---- modules newly loaded into OBS and PowerShell
+            if ($tick % 8 -eq 0) { $obsRoots = @(Get-ObsRoots) }
+            foreach ($op in @(Get-Process -Name obs64, obs32)) {
+                try {
+                    foreach ($m in $op.Modules) {
+                        $file = [string]$m.FileName
+                        if (-not $file -or -not $knownObsMods.Add($file)) { continue }
+                        if ($file.StartsWith("$env:SystemRoot\", [StringComparison]::OrdinalIgnoreCase)) { continue }
+                        $r = Test-ObsModule -File $file -Roots $obsRoots
+                        if ($r) { Write-MonitorEvent -Line ($r -replace '^(FAILURE|WARNING): ', '$1: New module - ') -AlwaysShow }
+                    }
+                } catch {}
+            }
+            foreach ($pp in @(Get-Process -Name powershell, pwsh, powershell_ise)) {
+                try {
+                    foreach ($m in $pp.Modules) {
+                        $file = [string]$m.FileName
+                        if (-not $file -or -not $knownPsMods.Add($file)) { continue }
+                        if ($file -match '(?i)\\assembly\\NativeImages_') { continue }
+                        $r = Test-PsModuleFile -File $file -Who $(if ($pp.Id -eq $PID) { 'this PowerShell session' } else { "PowerShell PID $($pp.Id)" })
+                        if ($r) { Write-MonitorEvent -Line ($r -replace '^(FAILURE|WARNING): ', '$1: New module - ') -AlwaysShow }
+                    }
+                } catch {}
             }
 
             # ---- newly started processes
@@ -1340,7 +1850,7 @@ try {
             }
         }
 
-        # ---- every ~20 s: antivirus state, exclusions, log clearing
+        # ---- every ~20 s: antivirus state, exclusions, log clearing, native API hooks (OBS tree re-verified every ~60 s)
         if ($tick % 40 -eq 0) {
             foreach ($l in (Get-DefenderAlerts)) { if ($l -like 'FAILURE*') { Write-MonitorEvent -Line $l } }
             foreach ($e in (Get-ExclusionList)) { if ($prevExcl.Add($e)) { Write-MonitorEvent -Line "FAILURE: Antivirus exclusion added during the session -> $e" -AlwaysShow } }
@@ -1349,6 +1859,10 @@ try {
                 foreach ($ev in @(Get-WinEvent -FilterHashtable $flt -MaxEvents 3)) { Write-MonitorEvent -Line "FAILURE: '$($flt.LogName)' event log cleared during the session" }
             }
             foreach ($l in (Get-ActiveThreatsOnly)) { Write-MonitorEvent -Line $l }
+            foreach ($l in (Get-SyscallHookAlerts)) { if ($l -like 'FAILURE*' -or $l -like 'WARNING*') { Write-MonitorEvent -Line $l } }
+            if ($tick % 120 -eq 0 -and @(Get-Process -Name obs64, obs32).Count -gt 0) {
+                foreach ($l in (Get-ObsTamperAlerts)) { if ($l -like 'FAILURE*' -or $l -like 'WARNING*') { Write-MonitorEvent -Line $l } }
+            }
         }
 
         $foot = if ($confirming) { 'Finish the session now?   Y = yes     any other key = keep monitoring' } else { '' }
